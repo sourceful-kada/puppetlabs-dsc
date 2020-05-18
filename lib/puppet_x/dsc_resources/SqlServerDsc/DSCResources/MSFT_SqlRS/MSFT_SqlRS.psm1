@@ -14,6 +14,7 @@ Import-Module -Name (Join-Path -Path (Split-Path (Split-Path $PSScriptRoot -Pare
 
     .PARAMETER DatabaseInstanceName
         Name of the SQL Server instance to host the Reporting Service database.
+        
 #>
 function Get-TargetResource
 {
@@ -32,6 +33,10 @@ function Get-TargetResource
         [Parameter(Mandatory = $true)]
         [System.String]
         $DatabaseInstanceName
+
+        #[Parameter(Mandatory = $false)]
+        #[System.String]
+        #$UseExistingDatabase = $false
     )
 
     $reportingServicesData = Get-ReportingServicesData -InstanceName $InstanceName
@@ -147,6 +152,10 @@ function Get-TargetResource
         parameter is not assigned a value, the default is that Reporting
         Services does not use SSL.
 
+    .PARAMETER UseExistingDatabase
+        If true, then no new database will be created
+        SSRS will be joined to existing database
+
     .NOTES
         To find out the parameter names for the methods in the class
         MSReportServer_ConfigurationSetting it's easy to list them using the
@@ -219,7 +228,16 @@ function Set-TargetResource
 
         [Parameter()]
         [System.Boolean]
-        $UseSsl
+        $UseSsl,
+
+        [Parameter()]
+        [System.Boolean]
+        $IsInitialized
+
+        #[Parameter()]
+        #[System.Boolean]
+        #$UseExistingDatabase = $true
+        
     )
 
     $reportingServicesData = Get-ReportingServicesData -InstanceName $InstanceName
@@ -355,45 +373,65 @@ function Set-TargetResource
                     Invoke-RsCimMethod @invokeRsCimMethodParameters
                 }
             }
-
-            $invokeRsCimMethodParameters = @{
-                CimInstance = $reportingServicesData.Configuration
-                MethodName = 'GenerateDatabaseCreationScript'
-                Arguments = @{
-                    DatabaseName = $reportingServicesDatabaseName
-                    IsSharePointMode = $false
-                    Lcid = $language
-                }
-            }
-
-            $reportingServicesDatabaseScript = Invoke-RsCimMethod @invokeRsCimMethodParameters
-
-            # Determine RS service account
-            $reportingServicesServiceAccountUserName = (Get-CimInstance -ClassName Win32_Service | Where-Object -FilterScript {
-                    $_.Name -eq $reportingServicesServiceName
-                }).StartName
-
-            $invokeRsCimMethodParameters = @{
-                CimInstance = $reportingServicesData.Configuration
-                MethodName = 'GenerateDatabaseRightsScript'
-                Arguments = @{
-                    DatabaseName = $reportingServicesDatabaseName
-                    UserName = $reportingServicesServiceAccountUserName
-                    IsRemote = $false
-                    IsWindowsUser = $true
-                }
-            }
-
-            $reportingServicesDatabaseRightsScript = Invoke-RsCimMethod @invokeRsCimMethodParameters
+            
+            
 
             <#
-                Import-SQLPSModule cmdlet will import SQLPS (SQL 2012/14) or SqlServer module (SQL 2016),
-                and if importing SQLPS, change directory back to the original one, since SQLPS changes the
-                current directory to SQLSERVER:\ on import.
+                Check If database exists on a target SQL server instance
+                If not, create it from scratch
+                If yes, join to scale-out group and exchange keys
             #>
+
             Import-SQLPSModule
-            Invoke-Sqlcmd -ServerInstance $reportingServicesConnection -Query $reportingServicesDatabaseScript.Script
-            Invoke-Sqlcmd -ServerInstance $reportingServicesConnection -Query $reportingServicesDatabaseRightsScript.Script
+
+            $ReportServerDatabaseExists = $false
+            if ((Invoke-Sqlcmd -ServerInstance $reportingServicesConnection -Query "SELECT name FROM master.dbo.sysdatabases WHERE ('[' + name + ']' = '[$($reportingServicesDatabaseName)]')").ItemArray.Count -gt 0) {
+                $ReportServerDatabaseExists = $true
+            }
+
+            if (-not $ReportServerDatabaseExists) 
+            # Create new database because it does not exists
+            {
+                $invokeRsCimMethodParameters = @{
+                    CimInstance = $reportingServicesData.Configuration
+                    MethodName = 'GenerateDatabaseCreationScript'
+                    Arguments = @{
+                        DatabaseName = $reportingServicesDatabaseName
+                        IsSharePointMode = $false
+                        Lcid = $language
+                    }
+                }
+
+                $reportingServicesDatabaseScript = Invoke-RsCimMethod @invokeRsCimMethodParameters
+
+                # Determine RS service account
+                $reportingServicesServiceAccountUserName = (Get-CimInstance -ClassName Win32_Service | Where-Object -FilterScript {
+                        $_.Name -eq $reportingServicesServiceName
+                    }).StartName
+
+                $invokeRsCimMethodParameters = @{
+                    CimInstance = $reportingServicesData.Configuration
+                    MethodName = 'GenerateDatabaseRightsScript'
+                    Arguments = @{
+                        DatabaseName = $reportingServicesDatabaseName
+                        UserName = $reportingServicesServiceAccountUserName
+                        IsRemote = $false
+                        IsWindowsUser = $true
+                    }
+                }
+
+                $reportingServicesDatabaseRightsScript = Invoke-RsCimMethod @invokeRsCimMethodParameters
+
+                <#
+                    Import-SQLPSModule cmdlet will import SQLPS (SQL 2012/14) or SqlServer module (SQL 2016),
+                    and if importing SQLPS, change directory back to the original one, since SQLPS changes the
+                    current directory to SQLSERVER:\ on import.
+                #>
+                
+                Invoke-Sqlcmd -ServerInstance $reportingServicesConnection -Query $reportingServicesDatabaseScript.Script
+                Invoke-Sqlcmd -ServerInstance $reportingServicesConnection -Query $reportingServicesDatabaseRightsScript.Script
+
+            } # // $ReportServerDatabaseExists
 
             $invokeRsCimMethodParameters = @{
                 CimInstance = $reportingServicesData.Configuration
@@ -425,15 +463,45 @@ function Set-TargetResource
 
             Invoke-RsCimMethod @invokeRsCimMethodParameters
 
-            $invokeRsCimMethodParameters = @{
-                CimInstance = $reportingServicesData.Configuration
-                MethodName = 'InitializeReportServer'
-                Arguments = @{
-                    InstallationId = $reportingServicesData.Configuration.InstallationID
+            if (-not $ReportServerDatabaseExists) {
+                $invokeRsCimMethodParameters = @{
+                    CimInstance = $reportingServicesData.Configuration
+                    MethodName = 'InitializeReportServer'
+                    Arguments = @{
+                        InstallationId = $reportingServicesData.Configuration.InstallationID
+                    }
+                }
+
+                Invoke-RsCimMethod @invokeRsCimMethodParameters
+
+            } else {
+                
+                # Exchange keys
+                Get-WmiObject -Namespace "Root\Microsoft\SqlServer\ReportServer" -Class "__Namespace" -ComputerName $reportingServicesConnection | Select-Object -ExpandProperty Name |
+                % {
+                    $NameSpaceRS = $_
+                    $SSRSInstance = $NameSpaceRS.SubString(3)
+                    $SQLVersion = (Get-WmiObject -Namespace "Root\Microsoft\SqlServer\ReportServer\$($NameSpaceRS)" -Class "__Namespace" -ComputerName $reportingServicesConnection).Name
+                    $SSRSClassWmi = Get-WmiObject -Namespace "Root\Microsoft\SqlServer\ReportServer\$($NameSpaceRS)\$($SQLVersion)\Admin" -Query "SELECT * FROM MSReportServer_ConfigurationSetting WHERE InstanceName='$($InstanceName)'" -ComputerName $reportingServicesConnection
+                    
+                    New-VerboseMessage -Message  "Copying SSRS key for instance $($SSRSInstance) | $($InstanceName) (SQL version: $($SQLVersion)) from $($reportingServicesConnection)"
+
+                    $KeyPassword = (-join ((33..126) | Get-Random -Count 32 | % {[char]$_}))
+                    $Key = $SSRSClassWmi.BackupEncryptionKey($KeyPassword)
+            
+                    If ($Key.HRESULT -ne 0) {
+                        $Key.ExtendedErrors -join "`r`n" | Write-Error
+                    } Else {
+            
+                    #New-VerboseMessage -Message  "Key Length: $($Key.KeyFile.Length)"
+
+                    $targetSSRSClassWmi = Get-WmiObject -Namespace "Root\Microsoft\SqlServer\ReportServer\$($NameSpaceRS)\$($SQLVersion)\Admin" -Query "SELECT * FROM MSReportServer_ConfigurationSetting WHERE InstanceName='$($InstanceName)'" -ComputerName 'localhost'
+                    $targetSSRSClassWmi.RestoreencryptionKey($Key.KeyFile, $Key.KeyFile.Length, $KeyPassword)
+            
+                    }
+            
                 }
             }
-
-            Invoke-RsCimMethod @invokeRsCimMethodParameters
 
             if ( $PSBoundParameters.ContainsKey('UseSsl') -and $UseSsl -ne $currentConfig.UseSsl )
             {
